@@ -9,7 +9,6 @@
 using namespace dlib;
 using namespace std;
 
-
 template <template <int,template<typename>class,int,typename> class block, int N, template<typename>class BN, typename SUBNET>
 using residual = add_prev1<block<N,BN,1,tag1<SUBNET>>>;
 
@@ -38,40 +37,89 @@ using anet_type = loss_metric<fc_no_bias<128,avg_pool_everything<
                             input_rgb_image_sized<150>
                             >>>>>>>>>>>>;
 
-
+// Distance calculation helper function
+double calculate_distance(const dlib::matrix<float, 0, 1>& v1, const dlib::matrix<float, 0, 1>& v2) {
+    return dlib::length(v1 - v2);
+}
 
 int main() {
     try {
-        // 1. Load YuNet
         string yunetPath = "C:/Users/Zzz/Documents/fad/models/face_detection_yunet_2023mar.onnx";
         cv::Ptr<cv::FaceDetectorYN> detector = cv::FaceDetectorYN::create(yunetPath, "", cv::Size(320, 320));
         if (detector.empty()) throw std::runtime_error("Failed to load YuNet model.");
 
-        // 2. Load Dlib Models (IMPORTANT: Extract the .bz2 files first!)
         shape_predictor sp;
-        // Point to the extracted .dat files, NOT the .bz2 files
         deserialize("C:/Users/Zzz/Documents/fad/models/shape_predictor_5_face_landmarks.dat") >> sp;
         
         anet_type net;
         deserialize("C:/Users/Zzz/Documents/fad/models/dlib_face_recognition_resnet_model_v1.dat") >> net;
 
+        string myFacePath = R"(C:\Users\Zzz\Documents\fad\faces\test.jpg)"; 
+        cv::Mat myOriginalFrame = cv::imread(myFacePath);
+        
+        if (myOriginalFrame.empty()) {
+            cerr << "Error: Could not load desktop image from " << myFacePath << endl;
+            cerr << "Please check if the file extension is exactly .jpg and not .jpeg or .png" << endl;
+            return -1;
+        }
+
+        // Resize the portrait image if it's too massive. YuNet operates best at standard dimensions.
+        cv::Mat myFrame;
+        int targetWidth = 640;
+        int targetHeight = static_cast<int>(myOriginalFrame.rows * (static_cast<float>(targetWidth) / myOriginalFrame.cols));
+        cv::resize(myOriginalFrame, myFrame, cv::Size(targetWidth, targetHeight));
+
+        cv::Mat myFaces;
+        detector->setInputSize(myFrame.size());
+        detector->detect(myFrame, myFaces);
+
+        if (myFaces.rows == 0) {
+            cerr << "Error: Still no face detected. Attempting lower confidence threshold fallback..." << endl;
+            
+            // Temporary threshold adjustment fallback just for this image initialization step
+            auto fallbackDetector = cv::FaceDetectorYN::create(yunetPath, "", myFrame.size(), 0.5f, 0.3f);
+            fallbackDetector->detect(myFrame, myFaces);
+            
+            if (myFaces.rows == 0) {
+                cerr << "Critical Error: YuNet cannot find a face. Ensure the photo isn't heavily cropped or sideways." << endl;
+                return -1;
+            }
+        }
+
+        // Generate 128D descriptor vector for the reference face
+        dlib::cv_image<bgr_pixel> dlib_my_img(myFrame);
+        int mx = static_cast<int>(myFaces.at<float>(0, 0));
+        int my = static_cast<int>(myFaces.at<float>(0, 1));
+        int mw = static_cast<int>(myFaces.at<float>(0, 2));
+        int mh = static_cast<int>(myFaces.at<float>(0, 3));
+        
+        dlib::rectangle d_my_rect(mx, my, mx + mw, my + mh);
+        auto my_shape = sp(dlib_my_img, d_my_rect);
+        
+        dlib::matrix<rgb_pixel> my_face_chip;
+        extract_image_chip(dlib_my_img, get_face_chip_details(my_shape, 150, 0.25), my_face_chip);
+        
+        dlib::matrix<float, 0, 1> my_reference_descriptor = net(my_face_chip);
+        cout << "Successfully encoded your desktop reference face!" << endl;
+
+        // 4. Set Up Webcam Pipeline
         cv::VideoCapture cap(0);
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
         if (!cap.isOpened()) {
             cerr << "Unable to connect to camera" << endl;
             return 1;
         }
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 
-        detector->setInputSize(cv::Size((int)cap.get(cv::CAP_PROP_FRAME_WIDTH), (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT)));
+        detector->setInputSize(cv::Size(640, 480));
 
         cv::Mat frame;
         int frame_count = 0;
         
-        // A structure to hold face data between heavy Dlib recognition frames
         struct TrackedFace {
             cv::Rect box;
             string label = "Processing...";
+            cv::Scalar color = cv::Scalar(0, 0, 255); // Default color (red)
         };
         std::vector<TrackedFace> tracked_faces;
 
@@ -80,8 +128,8 @@ int main() {
             cv::Mat faces;
             detector->detect(frame, faces);
 
-            // 1. If it's a "heavy" frame, update both detection AND recognition
-            if (frame_count % 6 == 0) { 
+            // Trigger complete processing context (landmarks + face verification execution) on target frames
+            if (frame_count % 6 == 0 || tracked_faces.size() != faces.rows) { 
                 tracked_faces.clear();
                 cv_image<bgr_pixel> dlib_img(frame);
 
@@ -94,21 +142,31 @@ int main() {
                     dlib::rectangle d_rect(x, y, x + w, y + h);
                     if (d_rect.is_empty()) continue;
 
-                    // Heavy operations: landmarks + ResNet
                     auto shape = sp(dlib_img, d_rect);
                     matrix<rgb_pixel> face_chip;
                     extract_image_chip(dlib_img, get_face_chip_details(shape, 150, 0.25), face_chip);
                     
-                    // The massive bottleneck line:
+                    // Heavy mathematical feature space representation layer extraction
                     matrix<float, 0, 1> face_descriptor = net(face_chip); 
 
+                    // Check similarity metric threshold 
+                    double distance = calculate_distance(face_descriptor, my_reference_descriptor);
+                    
                     TrackedFace tf;
                     tf.box = cv::Rect(x, y, w, h);
-                    tf.label = "Face Encoded"; // Here you would normally compare descriptors
+                    
+                    // Match boundary threshold context evaluation (Dlib target recommendation threshold: 0.6)
+                    if (distance < 0.4) {
+                        tf.label = "Zzz Match (" + to_string(distance).substr(0, 4) + ")";
+                        tf.color = cv::Scalar(0, 255, 0); // Green box
+                    } else {
+                        tf.label = "Unknown (" + to_string(distance).substr(0, 4) + ")";
+                        tf.color = cv::Scalar(0, 0, 255); // Red box
+                    }
                     tracked_faces.push_back(tf);
                 }
             } 
-            // 2. On skipped frames, just update the boxes using fast YuNet coordinates
+            // On skipped frames, smoothly pass geometric detection coordinates directly into display layer tracking structures
             else {
                 for (int i = 0; i < faces.rows && i < tracked_faces.size(); i++) {
                     tracked_faces[i].box.x = static_cast<int>(faces.at<float>(i, 0));
@@ -118,11 +176,11 @@ int main() {
                 }
             }
 
-            // 3. Draw the results smoothly on every frame
+            // Draw results on screen dynamically
             for (const auto& face : tracked_faces) {
-                cv::rectangle(frame, face.box, cv::Scalar(0, 255, 0), 2);
+                cv::rectangle(frame, face.box, face.color, 2);
                 cv::putText(frame, face.label, cv::Point(face.box.x, face.box.y - 10), 
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, face.color, 1);
             }
 
             cv::imshow("Face Detection & Encoding", frame);
