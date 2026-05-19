@@ -4,15 +4,14 @@ set(CMAKE_TOOLCHAIN_FILE "C:/Users/Zzz/Documents/vcpkg/scripts/buildsystems/vcpk
 project(fad VERSION 1.0)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 1. Look for OpenCV (Make sure it's installed on your system!)
 find_package(OpenCV REQUIRED)
+find_package(dlib REQUIRED)
 
-# 2. Add your source files
 add_executable(fad src/main.cpp)
 
-# 3. Link OpenCV to your app
-target_link_libraries(fad PRIVATE ${OpenCV_LIBS})
+target_link_libraries(fad PRIVATE ${OpenCV_LIBS} dlib::dlib)
 
-# 4. Include your own header files
 target_include_directories(fad PRIVATE include)
